@@ -1,0 +1,215 @@
+# RNA-Seq Pipeline Directory Structure
+
+rna_seq_pipeline/
+│
+├── raw_data/
+├── trimmed/
+├── qc/
+├── aligned/
+├── counts/
+├── scripts/
+├── reference/
+└── results/
+
+====================================================
+Step 1: Install Dependencies
+====================================================
+
+conda create -n rnaseq \
+python=3.10 \
+fastqc \
+multiqc \
+trim-galore \
+star \
+subread \
+samtools \
+hisat2 \
+- c bioconda \
+- c conda-forge
+
+conda activate rnaseq
+
+====================================================
+Step 2: Quality Control Script
+File: scripts/run_fastqc.sh
+====================================================
+
+#!/bin/bash
+
+mkdir -p qc
+
+for sample in raw_data/*.fastq.gz
+do
+    fastqc $sample -o qc/
+done
+
+multiqc qc/ -o qc/
+
+====================================================
+Step 3: Adapter and Quality Trimming
+File: scripts/trim_reads.sh
+====================================================
+
+#!/bin/bash
+
+mkdir -p trimmed
+
+for sample in raw_data/*_R1.fastq.gz
+do
+    base=$(basename $sample "_R1.fastq.gz")
+
+    trim_galore \
+    --paired \
+    raw_data/${base}_R1.fastq.gz \
+    raw_data/${base}_R2.fastq.gz \
+    -o trimmed/
+done
+
+====================================================
+Step 4: Build STAR Genome Index
+File: scripts/build_star_index.sh
+====================================================
+
+#!/bin/bash
+
+mkdir -p reference/star_index
+
+STAR \
+--runThreadN 8 \
+--runMode genomeGenerate \
+--genomeDir reference/star_index \
+--genomeFastaFiles reference/genome.fa \
+--sjdbGTFfile reference/genes.gtf \
+--sjdbOverhang 100
+
+====================================================
+Step 5: Alignment with STAR
+File: scripts/align_reads.sh
+====================================================
+
+#!/bin/bash
+
+mkdir -p aligned
+
+for sample in trimmed/*_val_1.fq.gz
+do
+    base=$(basename $sample "_R1_val_1.fq.gz")
+
+    STAR \
+    --runThreadN 8 \
+    --genomeDir reference/star_index \
+    --readFilesIn \
+    trimmed/${base}_R1_val_1.fq.gz \
+    trimmed/${base}_R2_val_2.fq.gz \
+    --readFilesCommand zcat \
+    --outSAMtype BAM SortedByCoordinate \
+    --outFileNamePrefix aligned/${base}_
+done
+
+====================================================
+Step 6: Gene Quantification
+File: scripts/count_features.sh
+====================================================
+
+#!/bin/bash
+
+mkdir -p counts
+
+featureCounts \
+-T 8 \
+-p \
+-a reference/genes.gtf \
+-o counts/gene_counts.txt \
+aligned/*Aligned.sortedByCoord.out.bam
+
+====================================================
+Step 7: Differential Expression in R
+File: scripts/deseq2_analysis.R
+====================================================
+
+library(DESeq2)
+library(ggplot2)
+library(pheatmap)
+
+# Load count matrix
+counts <- read.delim(
+    "counts/gene_counts.txt",
+    comment.char="#",
+    row.names=1
+)
+
+counts <- counts[,6:ncol(counts)]
+
+# Metadata
+sample_info <- data.frame(
+    row.names = colnames(counts),
+    condition = c("Control","Control","Treatment","Treatment")
+)
+
+# Create DESeq dataset
+dds <- DESeqDataSetFromMatrix(
+    countData = counts,
+    colData = sample_info,
+    design = ~ condition
+)
+
+# Filter low counts
+dds <- dds[rowSums(counts(dds)) > 10,]
+
+# Run differential expression
+dds <- DESeq(dds)
+
+res <- results(dds)
+
+# Save results
+write.csv(as.data.frame(res),
+          file="results/deseq2_results.csv")
+
+# Volcano Plot
+res_df <- as.data.frame(res)
+
+png("results/volcano_plot.png", width=1000, height=800)
+
+plot(
+    res_df$log2FoldChange,
+    -log10(res_df$pvalue),
+    pch=20,
+    main="Volcano Plot",
+    xlab="Log2 Fold Change",
+    ylab="-Log10 p-value"
+)
+
+dev.off()
+
+# PCA Plot
+vsd <- vst(dds)
+
+png("results/pca_plot.png", width=1000, height=800)
+
+plotPCA(vsd, intgroup="condition")
+
+dev.off()
+
+====================================================
+Step 8: Master Pipeline Script
+File: run_pipeline.sh
+====================================================
+
+#!/bin/bash
+
+echo "Running FastQC..."
+bash scripts/run_fastqc.sh
+
+echo "Trimming reads..."
+bash scripts/trim_reads.sh
+
+echo "Aligning reads..."
+bash scripts/align_reads.sh
+
+echo "Counting features..."
+bash scripts/count_features.sh
+
+echo "Running DESeq2..."
+Rscript scripts/deseq2_analysis.R
+
+echo "Pipeline completed successfully!"
